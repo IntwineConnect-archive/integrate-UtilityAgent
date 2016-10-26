@@ -1,0 +1,143 @@
+from __future__ import absolute_import
+
+from datetime import datetime
+import logging
+import sys
+
+from volttron.platform.vip.agent import Agent, Core, PubSub, compat
+from volttron.platform.agent import utils
+from volttron.platform.messaging import headers as headers_mod
+
+from . import settings
+import numpy as np 
+
+utils.setup_logging()
+_log = logging.getLogger(__name__)
+
+
+class UtilityAgent(Agent):
+    '''Listens to everything and publishes a heartbeat according to the
+    heartbeat period specified in the settings module.
+    '''
+    def __init__(self, config_path, **kwargs):
+        super(UtilityAgent, self).__init__(**kwargs)
+        self.config = utils.load_config(config_path)
+        self._agent_id = self.config['agentid']
+        
+        price_ulA=range(1,6)
+        self.quantity_ulA=range(1,6)
+        self.hwA_curves={}
+        self.number_of_hwA=1
+        
+    @Core.receiver('onsetup')
+    def setup(self, sender, **kwargs):
+        # Demonstrate accessing a value from the config file
+        #_log.info(self.config['message'])
+        self._agent_id = self.config['agentid']
+        print(self._agent_id) 
+    #combine all curves of homeownerAgents into a "demand curve"
+    def combine_curves(self,hwA_curves):
+        #append all price lists of homeownerAgents to temp_price
+        temp_price=[]
+        for key, value in hwA_curves.items():
+            temp_price+=value[0]
+        #remove duplicate prices
+        temp_price = list(set(temp_price))
+        temp_price.sort()
+        
+        #All items of quantity are initialized 0 
+        temp_quantity=[0]*len(temp_price)
+        for key, value in hwA_curves.items():
+            for i in range(len(value[1])):
+                '''For each item of quantity, find its index/position in temp_quantity and accumulate 
+                according to its corresponding price
+                '''
+                temp_quantity[temp_price.index(value[0][i])]+=value[1][i]
+        #combined curve
+        return temp_price,temp_quantity
+    
+    #Find the intersection/clearing price between "demand curve" and "supply curve" in "quantity-price" coordinate
+    def compute_clearing_price(self,hwA_curves):
+        temp_price,temp_quantity=self.combine_curves(hwA_curves)
+       
+        '''If the demand quantity extends the supply quantity, 
+         the supply curve will keep horizontal in the maximized quantity 
+         no matter how much price
+        '''
+        if len(temp_quantity)>len(self.quantity_ulA):
+            self.quantity_ulA+=(len(temp_quantity)-len(self.quantity_ulA))*[max(self.quantity_ulA)]
+        # Intersection lies in where Y Axis values are the same
+        s = np.array(temp_quantity)-np.array(self.quantity_ulA)  
+        i=0
+        while(s[i]>0):
+            i+=1
+        
+        if (i==0):
+	    _log.info("not sure if this always works kp")
+            clearing_price=s[0]
+        else:
+            #Algorithm works only for integers
+            if (temp_price[i]*temp_quantity[i]>temp_price[i-1]*self.quantity_ulA[i-1]):
+                clearing_price=temp_price[i]
+                clearing_quantity = temp_quantity[i]
+                revenue=clearing_price*temp_quantity[i]
+            else:
+                clearing_price=temp_price[i-1]
+                clearing_quantity = self.quantity_ulA[i-1]
+                revenue=clearing_price*self.quantity_ulA[i-1]
+        return clearing_price,clearing_quantity,revenue
+    
+    @PubSub.subscribe('pubsub', '')
+    def on_match(self, peer, sender, bus,  topic, headers, message):
+        #Use match_all to receive all messages and print them out.
+        if sender == 'pubsub.compat':
+            message = compat.unpack_legacy_message(headers, message)
+        if topic=="Bidding":           
+            _log.info(
+                "Topic: %r, from, %r, Demand curve: %r",topic, headers.get('AgentID'), message)
+            '''Curve Dictionary of Homeowner Agents
+            {AgentID: Bidding Price, Bidding Quantity}
+            '''            
+            self.hwA_curves[headers.get('AgentID')]=[message[1],message[3]]
+            
+            #Wait until getting all bidding/demand curves           
+            if len(self.hwA_curves)==self.number_of_hwA:
+                clearing_price,clearing_quantity,revenue=self.compute_clearing_price(self.hwA_curves)
+                message1 = [clearing_price, clearing_quantity]
+                self.vip.pubsub.publish('pubsub', 'clearing price', headers, message1)
+                _log.info('clearing price is: %r, clearing quantity is %r,  revenue: %r', clearing_price,clearing_quantity, revenue)
+            else:
+                _log.info('Waiting for bidding from homeownerAgent...')
+	elif (topic == "Load Status"):
+	    _log.info("message = %r", message)
+            
+            
+    # Demonstrate periodic decorator and settings access
+    @Core.periodic(settings.HEARTBEAT_PERIOD)
+    def publish_heartbeat(self):
+        '''Send heartbeat message every HEARTBEAT_PERIOD seconds.
+           sHEARTBEAT_PERIOD is set and can be adjusted in the settings module.
+        '''
+        now = datetime.utcnow().isoformat(' ') + 'Z'
+        headers = {
+            'AgentID': self._agent_id,
+            headers_mod.CONTENT_TYPE: headers_mod.CONTENT_TYPE.PLAIN_TEXT,
+            headers_mod.DATE: now,
+        }
+        
+        self.vip.pubsub.publish('pubsub', 'request for bids', headers, now)
+        _log.info('Request for bids ')
+        _log.info('Supply curve: y=x,x in [1,6]')
+        _log.info('Waiting for bidding from homeownerAgent...')
+
+def main(argv=sys.argv):
+    '''Main method called by the eggsecutable.'''
+    try:
+        utils.vip_main(UtilityAgent)
+    except Exception as e:
+        _log.exception('unhandled exception')
+
+
+if __name__ == '__main__':
+    # Entry point for script
+    sys.exit(main())
